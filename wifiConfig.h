@@ -1,155 +1,242 @@
-/*==============================================================================
- * WIFI CONFIGURATION
- *
- * You must configure your particular hardware. Follow the steps below.
- *
- * Currently StandardFirmataWiFi is configured as a server. An option to
- * configure as a client may be added in the future.
- *============================================================================*/
+#include <EEPROM.h> //Tên wifi và mật khẩu lưu vào ô nhớ 0->96
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <WebServer.h> //Thêm thư viện web server
+WebServer webServer(80); //Khởi tạo đối tượng webServer port 80
+#include <Ticker.h>
+Ticker blinker;
 
-// STEP 1 [REQUIRED]
-// Uncomment / comment the appropriate set of includes for your hardware (OPTION A, B or C)
-// Option A is enabled by default.
+String ssid;
+String password;
+#define ledPin 2
+#define btnPin 0
+unsigned long lastTimePress=millis();
+#define PUSHTIME 5000
+int wifiMode; //0:Chế độ cấu hình, 1:Chế độ kết nối, 2: Mất wifi
+unsigned long blinkTime=millis();
+//Tạo biến chứa mã nguồn trang web HTML để hiển thị trên trình duyệt
+const char html[] PROGMEM = R"html( 
+  <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>SETTING WIFI INFORMATION</title>
+        <style type="text/css">
+          body{display: flex;justify-content: center;align-items: center;}
+          button{width: 135px;height: 40px;margin-top: 10px;border-radius: 5px}
+          label, span{font-size: 25px;}
+          input{margin-bottom: 10px;width:275px;height: 30px;font-size: 17px;}
+          select{margin-bottom: 10px;width: 280px;height: 30px;font-size: 17px;}
+        </style>
+    </head>
+    <body>
+      <div>
+        <h3 style="text-align: center;">SETTING WIFI INFORMATION</h3>
+        <p id="info" style="text-align: center;">Scanning wifi network...!</p>
+        <label>Wifi name:</label><br>
+        <select id="ssid">
+          <option>Choise wifi name!</option>
+        </select><br>
+        <label>Password:</label><br>
+        <input id="password" type="text"><br>
 
-/*
- * OPTION A: Configure for Arduino WiFi shield
- *
- * This will configure StandardFirmataWiFi to use the original WiFi library (deprecated) provided
- * with the Arduino IDE. It is supported by the Arduino WiFi shield (a discontinued product) and
- * is compatible with 802.11 B/G networks.
- *
- * To configure StandardFirmataWiFi to use the Arduino WiFi shield
- * leave the #define below uncommented.
- */
-#define ARDUINO_WIFI_SHIELD
+        <button onclick="saveWifi()" style="background-color: cyan;margin-right: 10px">SAVE</button>
+        <button onclick="reStart()" style="background-color: pink;">RESTART</button>
+      </div>
+        <script type="text/javascript">
+          window.onload=function(){
+            scanWifi();
+          }
+          var xhttp = new XMLHttpRequest();
+          function scanWifi(){
+            xhttp.onreadystatechange = function(){
+              if(xhttp.readyState==4&&xhttp.status==200){
+                data = xhttp.responseText;
+                // alert(data);
+                document.getElementById("info").innerHTML = "WiFi scan completed!"
+                var obj = JSON.parse(data);
+                    var select = document.getElementById("ssid");
+                    for(var i=0; i<obj.length;++i){
+                      select[select.length] = new Option(obj[i],obj[i]);
+                    }
+              }
+            }
+            xhttp.open("GET","/scanWifi",true);
+            xhttp.send();
+          }
+          function saveWifi(){
+            ssid = document.getElementById("ssid").value;
+            pass = document.getElementById("password").value;
+            xhttp.onreadystatechange = function(){
+              if(xhttp.readyState==4&&xhttp.status==200){
+                data = xhttp.responseText;
+                alert(data);
+              }
+            }
+            xhttp.open("GET","/saveWifi?ssid="+ssid+"&pass="+pass,true);
+            xhttp.send();
+          }
+          function reStart(){
+            xhttp.onreadystatechange = function(){
+              if(xhttp.readyState==4&&xhttp.status==200){
+                data = xhttp.responseText;
+                alert(data);
+              }
+            }
+            xhttp.open("GET","/reStart",true);
+            xhttp.send();
+          }
+        </script>
+    </body>
+  </html>
+)html";
 
-//do not modify these next 4 lines
-#ifdef ARDUINO_WIFI_SHIELD
-#include "utility/WiFiStream.h"
-WiFiStream stream;
-#endif
+void blinkLed(uint32_t t){
+  if(millis()-blinkTime>t){
+    digitalWrite(ledPin,!digitalRead(ledPin));
+    blinkTime=millis();
+  }
+}
 
-/*
- * OPTION B: Configure for WiFi 101
- *
- * This will configure StandardFirmataWiFi to use the WiFi101 library, which works with the Arduino WiFi101
- * shield and devices that have the WiFi101 chip built in (such as the MKR1000). It is compatible
- * with 802.11 B/G/N networks.
- *
- * To enable, uncomment the #define WIFI_101 below and verify the #define values under
- * options A and C are commented out.
- *
- * IMPORTANT: You must have the WiFI 101 library installed. To easily install this library, opent the library manager via:
- * Arduino IDE Menus: Sketch > Include Library > Manage Libraries > filter search for "WiFi101" > Select the result and click 'install'
- */
-//#define WIFI_101
+void ledControl(){
+  if(digitalRead(btnPin)==LOW){
+    if(millis()-lastTimePress<PUSHTIME){
+      blinkLed(1000);
+    }else{
+      blinkLed(50);
+    }
+  }else{
+    if(wifiMode==0){
+      blinkLed(50);
+    }else if(wifiMode==1){
+      blinkLed(3000);
+    }else if(wifiMode==2){
+      blinkLed(300);
+    }
+  }
+}
 
-//do not modify these next 4 lines
-#ifdef WIFI_101
-#include "utility/WiFi101Stream.h"
-WiFi101Stream stream;
-#endif
+//Chương trình xử lý sự kiện wifi
+void WiFiEvent(WiFiEvent_t event) {
+  switch (event) {
+    case SYSTEM_EVENT_STA_GOT_IP:  //Gửi thông tin về PC khi kết nối wifi
+      Serial.println("Connected to WiFi");
+      Serial.print("IP Address: ");
+      Serial.println(WiFi.localIP());
+      wifiMode=1;
+      break;
+    case SYSTEM_EVENT_STA_DISCONNECTED: //Tự kết nối lại khi mất wifi
+      Serial.println("Disconnected from WiFi");
+      wifiMode=2;
+      WiFi.begin(ssid, password);
+      break;
+    default:
+      break;
+  }
+}
 
-/*
- * OPTION C: Configure for HUZZAH
- *
- * HUZZAH is not yet supported, this will be added in a later revision to StandardFirmataWiFi
- */
+void setupWifi(){
+  if(ssid!=""){
+    Serial.println("Connecting to wifi...!");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    WiFi.onEvent(WiFiEvent); //Đăng ký chương trình bắt sự kiện wifi
+  }else{
+    Serial.println("ESP32 wifi network created!");
+    WiFi.mode(WIFI_AP);
+    uint8_t macAddr[6];
+    WiFi.softAPmacAddress(macAddr);
+    String ssid_ap="ESP32-"+String(macAddr[4],HEX)+String(macAddr[5],HEX);
+    ssid_ap.toUpperCase();
+    WiFi.softAP(ssid_ap.c_str());
+    Serial.println("Access point name:"+ssid_ap);
+    Serial.println("Web server access address:"+WiFi.softAPIP().toString());
+    wifiMode=0;
+  }
+}
 
-//------------------------------
-// TODO
-//------------------------------
-//#define HUZZAH_WIFI
+void setupWebServer(){
+  //Thiết lập xử lý các yêu cầu từ client(trình duyệt web)
+  webServer.on("/",[]{
+    webServer.send(200, "text/html", html); //Gửi nội dung HTML
+  });
+  webServer.on("/scanWifi",[]{
+    Serial.println("Scanning wifi network...!");
+    int wifi_nets = WiFi.scanNetworks(true, true);
+    const unsigned long t = millis();
+    while(wifi_nets<0 && millis()-t<10000){
+      delay(20);
+      wifi_nets = WiFi.scanComplete();
+    }
+    DynamicJsonDocument doc(200);
+    for(int i=0; i<wifi_nets; ++i){
+      Serial.println(WiFi.SSID(i));
+      doc.add(WiFi.SSID(i));
+    }
+    //["tên wifi1","tên wifi2","tên wifi3",.....]
+    String wifiList = "";
+    serializeJson(doc, wifiList);
+    Serial.println("Wifi list: "+wifiList);
+    webServer.send(200,"application/json",wifiList);
+  });
+  webServer.on("/saveWifi",[]{
+    String ssid_temp = webServer.arg("ssid");
+    String password_temp = webServer.arg("pass");
+    Serial.println("SSID:"+ssid_temp);
+    Serial.println("PASS:"+password_temp);
+    EEPROM.writeString(0,ssid_temp);
+    EEPROM.writeString(32,password_temp);
+    EEPROM.commit();
+    webServer.send(200,"text/plain","Wifi has been saved!");
+  });
+  webServer.on("/reStart",[]{
+    webServer.send(200,"text/plain","Esp32 is restarting!");
+    delay(3000);
+    ESP.restart();
+  });
+  webServer.begin(); //Khởi chạy dịch vụ web server trên ESP32
+}
 
+void checkButton(){
+  if(digitalRead(btnPin)==LOW){
+    Serial.println("Press and hold for 5 seconds to reset to default!");
+    if(millis()-lastTimePress>PUSHTIME){
+      for(int i=0; i<100;i++){
+        EEPROM.write(i,0);
+      }
+      EEPROM.commit();
+      Serial.println("EEPROM memory erased!");
+      delay(2000);
+      ESP.restart();
+    }
+    delay(1000);
+  }else{
+    lastTimePress=millis();
+  }
+}
 
-// STEP 2 [REQUIRED for all boards and shields]
-// replace this with your wireless network SSID
-char ssid[] = "your_network_name";
-
-// STEP 3 [OPTIONAL for all boards and shields]
-// if you want to use a static IP (v4) address, uncomment the line below. You can also change the IP.
-// if this line is commented out, the WiFi shield will attempt to get an IP from the DHCP server
-// #define STATIC_IP_ADDRESS 192,168,1,113
-
-// STEP 4 [REQUIRED for all boards and shields]
-// define your port number here, you will need this to open a TCP connection to your Arduino
-#define SERVER_PORT 3030
-
-// STEP 5 [REQUIRED for all boards and shields]
-// determine your network security type (OPTION A, B, or C). Option A is the most common, and the default.
-
-
-/*
- * OPTION A: WPA / WPA2
- *
- * WPA is the most common network security type. A passphrase is required to connect to this type.
- *
- * To enable, leave #define WIFI_WPA_SECURITY uncommented below, set your wpa_passphrase value appropriately,
- * and do not uncomment the #define values under options B and C
- */
-#define WIFI_WPA_SECURITY
-
-#ifdef WIFI_WPA_SECURITY
-char wpa_passphrase[] = "your_wpa_passphrase";
-#endif  //WIFI_WPA_SECURITY
-
-/*
- * OPTION B: WEP
- *
- * WEP is a less common (and regarded as less safe) security type. A WEP key and its associated index are required
- * to connect to this type.
- *
- * To enable, Uncomment the #define below, set your wep_index and wep_key values appropriately, and verify
- * the #define values under options A and C are commented out.
- */
-//#define WIFI_WEP_SECURITY
-
-#ifdef WIFI_WEP_SECURITY
-//The wep_index below is a zero-indexed value.
-//Valid indices are [0-3], even if your router/gateway numbers your keys [1-4].
-byte wep_index = 0;
-char wep_key[] = "your_wep_key";
-#endif  //WIFI_WEP_SECURITY
-
-
-/*
- * OPTION C: Open network (no security)
- *
- * Open networks have no security, can be connected to by any device that knows the ssid, and are unsafe.
- *
- * To enable, uncomment #define WIFI_NO_SECURITY below and verify the #define values
- * under options A and B are commented out.
- */
-//#define WIFI_NO_SECURITY
-
-/*==============================================================================
- * CONFIGURATION ERROR CHECK (don't change anything here)
- *============================================================================*/
-
-#if ((defined(ARDUINO_WIFI_SHIELD) && (defined(WIFI_101) || defined(HUZZAH_WIFI))) || (defined(WIFI_101) && defined(HUZZAH_WIFI)))
-#error "you may not define more than one wifi device type in wifiConfig.h."
-#endif //WIFI device type check
-
-#if !(defined(ARDUINO_WIFI_SHIELD) || defined(WIFI_101) || defined(HUZZAH_WIFI))
-#error "you must define a wifi device type in wifiConfig.h."
-#endif
-
-#if ((defined(WIFI_NO_SECURITY) && (defined(WIFI_WEP_SECURITY) || defined(WIFI_WPA_SECURITY))) || (defined(WIFI_WEP_SECURITY) && defined(WIFI_WPA_SECURITY)))
-#error "you may not define more than one security type at the same time in wifiConfig.h."
-#endif  //WIFI_* security define check
-
-#if !(defined(WIFI_NO_SECURITY) || defined(WIFI_WEP_SECURITY) || defined(WIFI_WPA_SECURITY))
-#error "you must define a wifi security type in wifiConfig.h."
-#endif  //WIFI_* security define check
-
-/*==============================================================================
- * PIN IGNORE MACROS (don't change anything here)
- *============================================================================*/
-
-// ignore SPI pins, pin 5 (reset WiFi101 shield), pin 7 (WiFi handshake) and pin 10 (WiFi SS)
-// also don't ignore SS pin if it's not pin 10
-// TODO - need to differentiate between Arduino WiFi1 101 Shield and Arduino MKR1000
-#define IS_IGNORE_WIFI101_SHIELD(p)  ((p) == 10 || (IS_PIN_SPI(p) && (p) != SS) || (p) == 5 || (p) == 7)
-
-// ignore SPI pins, pin 4 (SS for SD-Card on WiFi-shield), pin 7 (WiFi handshake) and pin 10 (WiFi SS)
-#define IS_IGNORE_WIFI_SHIELD(p)     ((IS_PIN_SPI(p) || (p) == 4) || (p) == 7 || (p) == 10)
+class Config{
+public:
+  void begin(){
+    pinMode(ledPin,OUTPUT);
+    pinMode(btnPin,INPUT_PULLUP);
+    blinker.attach_ms(50, ledControl);
+    EEPROM.begin(100);
+    char ssid_temp[32], password_temp[64];
+    EEPROM.readString(0,ssid_temp, sizeof(ssid_temp));
+    EEPROM.readString(32,password_temp,sizeof(password_temp));
+    ssid = String(ssid_temp);
+    password = String(password_temp);
+    if(ssid!=""){
+      Serial.println("Wifi name:"+ssid);
+      Serial.println("Password:"+password);
+    }
+    setupWifi(); //Thiết lập wifi
+    if(wifiMode==0) setupWebServer(); //Thiết lập webserver
+  }
+  void run(){
+    checkButton();
+    if(wifiMode==0)webServer.handleClient(); //Lắng nghe yêu cầu từ trình client
+  }
+} wifiConfig;
